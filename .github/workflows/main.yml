@@ -1,0 +1,85 @@
+name: Build kext
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ACID32: 1
+  PROJECT_TYPE: KEXT
+
+jobs:
+  build:
+    name: Debug + Release
+    runs-on: macos-latest
+    env:
+      JOB_TYPE: BUILD
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: acidanthera/Lilu
+          path: Lilu
+
+      - uses: actions/checkout@v4
+        with:
+          repository: acidanthera/MacKernelSDK
+          path: MacKernelSDK
+
+      - name: CI Bootstrap
+        working-directory: ${{ github.workspace }}
+        run: |
+          src=$(/usr/bin/curl -Lfs https://raw.githubusercontent.com/acidanthera/ocbuild/master/ci-bootstrap.sh) && eval "$src" || exit 1
+
+      - name: Build Debug
+        working-directory: ${{ github.workspace }}
+        run: xcodebuild -project KernelDebugger.xcodeproj -jobs 1 -arch x86_64 -arch ACID32 -configuration Debug
+
+      - name: Build Release
+        working-directory: ${{ github.workspace }}
+        run: xcodebuild -project KernelDebugger.xcodeproj -jobs 1 -arch x86_64 -arch ACID32 -configuration Release
+
+      - name: Create Version Tag
+        id: version_tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: ${{ github.workspace }}
+        run: |
+          plist="build/Release/KernelDebugger.kext/Contents/Info.plist"
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$plist")
+          tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${tag} already exists, skipping creation."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "Release ${tag}"
+          git push origin "${tag}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelDebugger-zips
+          path: build/*/*.zip
+
+      - name: Publish Release Assets
+        if: startsWith(github.ref, 'refs/tags/v') || steps.version_tag.outputs.created == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || steps.version_tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: build/*/*.zip
+          generate_release_notes: true
