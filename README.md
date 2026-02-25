@@ -31,7 +31,7 @@ This kext comes with a number of boot arguments to control its behavior. Add the
 - `-krnldbglogdisable`: Disable file logging (ring buffer still captures messages).
 - `-krnldbglogtmp`: Force log output to `/private/var/tmp/krnl.log`.
 - `-krnldbgloginitfast`: Begin file creation immediately at boot (skip the default 5-second uptime wait).
-- `-krnldbglogopportunistic`: Flush to disk on every log write instead of waiting for the timer (higher I/O, lower latency).
+- `-krnldbglogopport`: Flush to disk on every log write instead of waiting for the timer (higher I/O, lower latency).
 - `-krnldbglogbig`: Use a large 16 MB ring buffer (same as `krnldbglogbufmb=16`).
 
 #### Log Path & Destination

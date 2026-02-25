@@ -61,8 +61,15 @@ static const char *krnldbgbeta[] {
 };
 
 static krnldbg Krnldbg;
-static int (*origPrnt)(const char *, va_list, void (*)(int, void *), void *, int, int) = nullptr;
-static bool gInPrntHook = false;
+static void (*origConsoleWrite)(const char *, int) = nullptr;
+static bool gInConsoleWriteHook = false;
+
+// Line accumulation buffer — coalesces console_write fragments into complete lines
+static const size_t kLineAccumMax = 4096;
+static char gLineAccumBuf[kLineAccumMax];
+static uint32_t gLineAccumPos = 0;
+static clock_sec_t gLineAccumSecs = 0;
+static clock_usec_t gLineAccumUsecs = 0;
 
 // file logging controls
 static bool gFileLoggingEnabled = true;            // disable with -krnldbglogdisable
@@ -101,16 +108,19 @@ static void krnldbgTryInitFile();          // forward declaration
 static void krnldbgSearchVolume();         // forward declaration
 static bool krnldbgParseVolumePath(const char *path, char *outVol, size_t outVolSize, char *outRel, size_t outRelSize);
 
-static void krnldbgStoreLog(const char *tag, const char *msg) {
-	if (!tag || !msg || !gLogBuffer) return;
-	// Filter out very short messages (likely char-by-char noise from hex dumps)
-	size_t msgLen = strlen(msg);
-	if (msgLen < 3) return; // skip single chars and 2-char hex bytes
-	clock_sec_t secs; clock_usec_t usecs; clock_get_system_microtime(&secs, &usecs);
-	char line[1024];
-	int len = snprintf(line, sizeof(line), "%llu.%06u [%s] %s\n", (unsigned long long)secs, (unsigned)usecs, tag, msg);
-	if (len <= 0) return;
-	if (len > (int)sizeof(line)) len = (int)sizeof(line);
+// Flush one complete accumulated line into the ring buffer with its captured timestamp
+static void krnldbgFlushAccumLine() {
+	if (gLineAccumPos == 0 || !gLogBuffer) return;
+	char line[kLineAccumMax + 64]; // room for timestamp prefix
+	int prefixLen = snprintf(line, sizeof(line), "%llu.%06u ",
+		(unsigned long long)gLineAccumSecs, (unsigned)gLineAccumUsecs);
+	if (prefixLen <= 0 || prefixLen >= (int)sizeof(line)) { gLineAccumPos = 0; return; }
+	int remaining = (int)sizeof(line) - prefixLen - 2; // room for \n + sentinel
+	int copyLen = (int)gLineAccumPos < remaining ? (int)gLineAccumPos : remaining;
+	memcpy(line + prefixLen, gLineAccumBuf, copyLen);
+	int len = prefixLen + copyLen;
+	if (line[len - 1] != '\n') { line[len] = '\n'; len++; }
+	gLineAccumPos = 0;
 	uint32_t total = (uint32_t)len + 1; // include sentinel
 	uint32_t start = __c11_atomic_fetch_add(&gLogWritePos, total, __ATOMIC_RELAXED);
 	uint32_t endPos = start + total;
@@ -518,27 +528,38 @@ static void krnldbgFlushTimer(OSObject *, IOTimerEventSource *) {
 	if (gLogTimer) gLogTimer->setTimeoutMS(gFlushIntervalMs);
 }
 
-static int hookedPrnt(const char *fmt, va_list ap, void (*putcFn)(int, void *), void *arg, int radix, int flags) {
-	if (!origPrnt) return 0;
-	if (gInPrntHook) { return origPrnt(fmt, ap, putcFn, arg, radix, flags); }
-	gInPrntHook = true;
-	if (fmt) {
-		char buffer[1024];
-		va_list ap_copy;
-		va_copy(ap_copy, ap);
-		vsnprintf(buffer, sizeof(buffer), fmt, ap_copy);
-		va_end(ap_copy);
-		krnldbgStoreLog("___doprnt", buffer);
+// Accumulate console_write fragments and flush on newline (or buffer full).
+// This coalesces many small writes into complete lines with a single timestamp.
+static void krnldbgAccumConsoleWrite(const char *buf, int bufLen) {
+	if (!buf || bufLen <= 0 || !gLogBuffer) return;
+	for (int i = 0; i < bufLen; ++i) {
+		char c = buf[i];
+		// Capture timestamp at the start of each new line
+		if (gLineAccumPos == 0)
+			clock_get_system_microtime(&gLineAccumSecs, &gLineAccumUsecs);
+		gLineAccumBuf[gLineAccumPos++] = c;
+		// Flush on newline or when the accumulation buffer is full
+		if (c == '\n' || gLineAccumPos >= kLineAccumMax - 1)
+			krnldbgFlushAccumLine();
+	}
+}
+
+static void hookedConsoleWrite(const char *buf, int len) {
+	if (!origConsoleWrite) return;
+	if (gInConsoleWriteHook) { origConsoleWrite(buf, len); return; }
+	gInConsoleWriteHook = true;
+	if (buf && len > 0) {
+		krnldbgAccumConsoleWrite(buf, len);
 		if (gOpportunisticFlush) krnldbgFlushToFile(false);
 	}
-	gInPrntHook = false;
-	return origPrnt(fmt, ap, putcFn, arg, radix, flags);
+	gInConsoleWriteHook = false;
+	origConsoleWrite(buf, len);
 }
 
 static void routeLogs(KernelPatcher &patcher) {
 	// Hook the required logging function
 	KernelPatcher::RouteRequest reqs[] {
-		KernelPatcher::RouteRequest("___doprnt", hookedPrnt, reinterpret_cast<mach_vm_address_t &>(origPrnt))
+		KernelPatcher::RouteRequest("_console_write", hookedConsoleWrite, reinterpret_cast<mach_vm_address_t &>(origConsoleWrite))
 	};
 	
 	if (!patcher.routeMultiple(KernelPatcher::KernelID, reqs, arrsize(reqs))) {
@@ -577,7 +598,7 @@ static void onPatcherLoad(void *user, KernelPatcher &patcher) {
 		SYSLOG("krnldbg", "Early file init enabled (uptime min = 0)");
 	}
 	// Enable opportunistic flush on every log write (default off)
-	if (checkKernelArgument("-krnldbglogopportunistic")) {
+	if (checkKernelArgument("-krnldbglogopport")) {
 		gOpportunisticFlush = true;
 		SYSLOG("krnldbg", "Opportunistic flush enabled");
 	}
