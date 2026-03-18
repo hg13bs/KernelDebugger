@@ -1,6 +1,6 @@
 # KernelDebugger
 
-Finally, a kext that dumps kernel debug messages to a file for later analysis without the need of a serial connection or screen capture. Also useful on recoveryOS or the installer stage.
+Finally, a kext that can dump kernel debug messages to a file for later analysis without the need of a serial connection or screen capture. Also useful on recoveryOS or the installer stage.
 
 ## Requirements
 
@@ -9,16 +9,22 @@ Finally, a kext that dumps kernel debug messages to a file for later analysis wi
 - macOS Monterey or newer (possibly lower too, but untested).
 
 ## Building from Source
+
 1. Clone the repository: `git clone https://github.com/hg13bs/KernelDebugger`
 2. Initalize submodules: `git submodule update --init --recursive`
 3. Open `KernelDebugger.xcodeproj` in Xcode or build using `xcodebuild` from the command line (e.g. `xcodebuild -scheme KernelDebugger -configuration Release`).
 
 ## Installation
+
 1. Download the latest release from the [Releases](https://github.com/hg13bs/KernelDebugger/releases) page.
+2. Ensure your config.plist is configured to have the kext loaded properly
+
+> [!TIP]
+> Don't forget to remove/disable this kext while not debugging as you may leave out a bunch of I/O consumption or memory usage to happen
 
 ### Boot Arguments
 
-This kext comes with a number of boot arguments to control its behavior. Add them to your bootloader's `boot-args` variable as needed.
+This kext comes with a number of boot arguments to control its behavior. Add them to OpenCore's `boot-args` variable as needed.
 
 #### General
 
@@ -53,9 +59,12 @@ This kext comes with a number of boot arguments to control its behavior. Add the
 - `krnldbglogthresh` (`uint32` bytes, default: `8192`): Minimum buffered bytes before a non-forced flush writes to disk.
 
 ## Issues & Limitations
+
 - Not all log sources may be captured, especially early boot messages before the kext initializes and including some user-space logs that don't go through the hooked functions.
 
 - File I/O is performed in a workqueue context, which may be deferred during heavy system load or panic conditions.
+
+- The kext may not have enough time to dump the kernel messages into a file before the kernel reboots while the target partition may not have fully finished mounting.
 
 - For others, see the [Issues](https://github.com/hg13bs/KernelDebugger/issues) page.
 
@@ -64,3 +73,7 @@ This kext comes with a number of boot arguments to control its behavior. Add the
 - [Apple](https://www.apple.com) for macOS (duh)
 - [Acidanthera](https://github.com/acidanthera) for Lilu/MacKernelSDK
 - [Anthropic](https://www.anthropic.com) for Claude, which was used to help with the kext implementation and code documentation.
+
+## License
+
+This project is licensed under MIT, see the [LICENSE](LICENSE) file for details.

@@ -459,6 +459,23 @@ static int krnldbgVolumeIterate(mount_t mp, void *arg) {
 	const char *mnt = st->f_mntonname;
 	if (!mnt || !mnt[0]) return VFS_RETURNED;
 
+	// Reject mounts that are not fully ready for writing
+	uint64_t mntflags = vfs_flags(mp);
+
+	// Must be read-write
+	if (mntflags & MNT_RDONLY) return VFS_RETURNED;
+
+	// Must be a local filesystem (not network)
+	if (!(mntflags & MNT_LOCAL)) return VFS_RETURNED;
+
+	// Reject autofs trigger mounts (transient placeholders before real mount)
+	char fstype[16] = {0};
+	vfs_name(mp, fstype);
+	if (strcmp(fstype, "autofs") == 0) return VFS_RETURNED;
+
+	// Require actual backing storage (autofs/placeholders report zero blocks)
+	if (st->f_blocks == 0 || st->f_bsize == 0) return VFS_RETURNED;
+
 	if (ctx->targetBsd && ctx->targetBsd[0]) {
 		const char *from = st->f_mntfromname;
 		if (!from || !from[0]) return VFS_RETURNED;

@@ -53,7 +53,11 @@ jobs:
         run: |
           plist="build/Release/KernelDebugger.kext/Contents/Info.plist"
           version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$plist")
-          tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+          else
+            tag="v${version}"
+          fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
@@ -72,7 +76,7 @@ jobs:
       - name: Upload to Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: KernelDebugger-zips
+          name: Artifacts
           path: build/*/*.zip
 
       - name: Publish Release Assets
