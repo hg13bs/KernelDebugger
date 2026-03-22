@@ -19,7 +19,7 @@
 	<key>CFBundleVersion</key>
 	<string>$(MODULE_VERSION)</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2025 hg13</string>
+	<string>Copyright © 2026 hg13</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>com.hg13.KernelDebugger</key>

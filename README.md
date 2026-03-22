@@ -18,9 +18,14 @@ Finally, a kext that can dump kernel debug messages to a file for later analysis
 
 1. Download the latest release from the [Releases](https://github.com/hg13bs/KernelDebugger/releases) page.
 2. Ensure your config.plist is configured to have the kext loaded properly
+3. Optionally, add desired boot arguments to control the kext's behavior (see below).
+
+> [!NOTE]
+> Don't forget to remove/disable this kext while not debugging as you may leave out a bunch of I/O consumption or memory usage to happen in the background.
+> Additionally, be cautious when enabling keyboard input logging as it may capture sensitive information.
 
 > [!TIP]
-> Don't forget to remove/disable this kext while not debugging as you may leave out a bunch of I/O consumption or memory usage to happen
+> Some kernel/kext logs may not show without adding [DebugEnhancer](https://github.com/acidanthera/DebugEnhancer) to your kexts.
 
 ### Boot Arguments
 
@@ -31,6 +36,14 @@ This kext comes with a number of boot arguments to control its behavior. Add the
 - `-krnldbgoff`: Disable the kext entirely.
 - `-krnldbgbeta`: Force loading on unsupported macOS versions (use with caution).
 - `-krnldbgdebug`: Enable debug logging for the kext itself.
+- `-krnldbgkeylog`: Log HID keyboard input (may include sensitive data, use with caution).
+- `-krnldbgskipwait`: Ignores shutdown checks in the log flushing function, allowing it to run even during shutdown.
+- `krnldbgnohotkey`: Disable hotkey support for triggering various diagnotic actions.
+
+#### Keyboard hotkeys
+
+- Ctrl+Shift+D: Dumps the current IORegistry to a file named `ioreg_dump.txt` in the same directory as the log file.
+- Ctrl+Shift+K: Dumps loaded non-Apple kext information to a file named `kextstat_dump.txt` in the same directory as the log file.
 
 #### File Logging
 

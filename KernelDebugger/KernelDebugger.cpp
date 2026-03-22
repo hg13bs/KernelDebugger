@@ -13,6 +13,16 @@
 #include <Headers/kern_file.hpp>
 #include <sys/mount.h>
 #include <sys/vnode.h>
+#include <IOKit/IORegistryEntry.h>
+#include <IOKit/hidsystem/IOLLEvent.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
+
+// copyLoadedKextInfo will be used within the hotkey handler to get kext info for the dump.
+typedef OSDictionary * (*copyLoadedKextInfoFunc)(OSArray * kextIdentifiers, OSArray * infoKeys);
+static copyLoadedKextInfoFunc gcopyLoadedKextInfo = nullptr;
+
+// Forward declarations for IOHIDSystem hook
+class IOHIDSystem;
 
 static int appendBufferToFile(const char *path, void *buffer, size_t size) {
 	if (!buffer || size == 0) return 0;
@@ -53,7 +63,8 @@ static const char *krnldbgoff[] {
 };
 
 static const char *krnldbgdebug[] {
-    "-krnldbgdebug"
+    "-krnldbgdebug",
+    "-krnldbgkeylog"
 };
 
 static const char *krnldbgbeta[] {
@@ -97,6 +108,34 @@ static uint32_t gLogInitUptimeSecMin = 5;  // do not attempt file IO before this
 static uint32_t gFlushErrors = 0;          // consecutive flush write errors
 static bool gForcedTmpPath = false;        // boot arg -krnldbglogtmp forces /private/var/tmp path
 static bool gOpportunisticFlush = false;   // optional immediate flush on log writes
+static _Atomic(bool) gSystemShuttingDown = false; // set during shutdown/restart to prevent file ops
+static IONotifier *gPowerNotifier = nullptr;       // power management notifier
+static bool gSkipShutdownWait = false;             // cached from -krnldbgskipwait boot arg
+static void krnldbgFlushToFile(bool force);        // forward declaration
+
+// Power event callback - detect shutdown/restart
+static IOReturn krnldbgPowerEventHandler(void *target, void *refCon,
+                                          UInt32 messageType, IOService *provider,
+                                          void *messageArgument, vm_size_t argSize) {
+	switch (messageType) {
+		case kIOMessageSystemWillPowerOff:
+			SYSLOG("krnldbg", "System powering off, disabling file operations");
+			__c11_atomic_store(&gSystemShuttingDown, true, __ATOMIC_RELEASE);
+			break;
+		case kIOMessageSystemWillRestart:
+			SYSLOG("krnldbg", "System restarting, disabling file operations");
+			__c11_atomic_store(&gSystemShuttingDown, true, __ATOMIC_RELEASE);
+			break;
+		case kIOMessageSystemWillSleep:
+			// Flush any pending data before sleep
+			SYSLOG("krnldbg", "System going to sleep, flushing logs to file if needed");
+			if (gLogReady && !__c11_atomic_load(&gSystemShuttingDown, __ATOMIC_ACQUIRE)) {
+				krnldbgFlushToFile(true);
+			}
+			break;
+	}
+	return kIOReturnSuccess;
+}
 static char gTargetVolumeName[128] = {0};  // target volume name from krnldbglogvol=<name>
 static char gTargetBSDName[64] = {0};      // target BSD device from krnldbglogbsd=<diskXsY>
 static char gLogFileName[64] = "krnl.log"; // log file name (can be customized)
@@ -107,6 +146,58 @@ static uint32_t gMaxVolumeSearchAttemptsBeforeFallback = 60; // after ~60 timer 
 static void krnldbgTryInitFile();          // forward declaration
 static void krnldbgSearchVolume();         // forward declaration
 static bool krnldbgParseVolumePath(const char *path, char *outVol, size_t outVolSize, char *outRel, size_t outRelSize);
+
+// Keyboard hotkey for IORegistry dump
+static bool gHotkeyEnabled = true;                  // disable with -krnldbgnohotkey
+static _Atomic(uint64_t) gLastDumpTime = 0;         // debounce timestamp (mach_absolute_time)
+static _Atomic(uint8_t) gDumpInProgress = 0;        // prevent concurrent dumps
+static char gIORegDumpPath[256] = {0};              // computed from gLogFilePath
+static const uint64_t kDumpDebounceNs = 2000000000ULL; // 2 second debounce
+
+// Kextstat dump (Ctrl+Shift+K)
+static _Atomic(uint64_t) gLastKextDumpTime = 0;     // debounce for kext dump
+static _Atomic(uint8_t) gKextDumpInProgress = 0;    // prevent concurrent kext dumps
+static char gKextDumpPath[256] = {0};               // computed from gLogFilePath
+static bool gHIDKeyLogEnabled = false;              // cached from boot arg at init
+
+// Helper to compute IORegistry dump path from current log path
+static void krnldbgUpdateIORegDumpPath() {
+	if (!gHotkeyEnabled || !gLogFilePath[0]) return;
+	const char *lastSlash = strrchr(gLogFilePath, '/');
+	if (lastSlash) {
+		size_t dirLen = lastSlash - gLogFilePath;
+		memcpy(gIORegDumpPath, gLogFilePath, dirLen);
+		strlcpy(gIORegDumpPath + dirLen, "/ioreg_dump.txt", sizeof(gIORegDumpPath) - dirLen);
+		memcpy(gKextDumpPath, gLogFilePath, dirLen);
+		strlcpy(gKextDumpPath + dirLen, "/kextstat_dump.txt", sizeof(gKextDumpPath) - dirLen);
+	} else {
+		strlcpy(gIORegDumpPath, "/private/var/log/ioreg_dump.txt", sizeof(gIORegDumpPath));
+		strlcpy(gKextDumpPath, "/private/var/log/kextstat_dump.txt", sizeof(gKextDumpPath));
+	}
+}
+
+// Forward declaration for IOHIDEventService
+class IOHIDEventService;
+static void (*origDispatchKeyboardEvent)(IOHIDEventService *, unsigned long long,
+                                          unsigned, unsigned, unsigned, unsigned) = nullptr;
+// Track modifier state (since HID events come separately)
+static _Atomic(unsigned) gModifierState = 0;
+static void krnldbgTriggerIORegDump();              // forward declaration
+static void krnldbgScheduleIORegDump();             // forward declaration
+
+// HID Usage codes (Keyboard page as 0x07) for hotkey detection
+#define kHIDUsage_KeyboardD             0x07
+#define kHIDUsage_KeyboardK             0x0E
+#define kHIDUsage_KeyboardLeftControl   0xE0
+#define kHIDUsage_KeyboardLeftShift     0xE1
+#define kHIDUsage_KeyboardRightControl  0xE4
+#define kHIDUsage_KeyboardRightShift    0xE5
+#define kModCtrl  0x01
+#define kModShift 0x02
+
+// IOHIDFamily kext info for keyboard hook
+static const char *kIOHIDFamilyPaths[] { "/System/Library/Extensions/IOHIDFamily.kext/Contents/MacOS/IOHIDFamily" };
+static KernelPatcher::KextInfo kIOHIDFamilyInfo { "com.apple.iokit.IOHIDFamily", kIOHIDFamilyPaths, 1, {true}, {}, KernelPatcher::KextInfo::Unloaded };
 
 // Flush one complete accumulated line into the ring buffer with its captured timestamp
 static void krnldbgFlushAccumLine() {
@@ -174,6 +265,9 @@ static void krnldbgFlushAccumLine() {
 // Flush accumulated ring buffer data to file (append). Force flush ignores threshold.
 static void krnldbgFlushToFile(bool force) {
 	if (!gFileLoggingEnabled || !gLogReady || !gLogBuffer) return;
+	if (!gSkipShutdownWait) {
+		if (__c11_atomic_load(&gSystemShuttingDown, __ATOMIC_ACQUIRE)) return;
+	}
 	if (__c11_atomic_exchange(&gInFlush, 1, __ATOMIC_ACQUIRE)) return;
 	
 	// Snapshot positions atomically
@@ -298,6 +392,9 @@ static void krnldbgFlushToFile(bool force) {
 
 static void krnldbgTryInitFile() {
 	if (!gFileLoggingEnabled || gLogReady) return;
+	if (!gSkipShutdownWait) {
+		if (__c11_atomic_load(&gSystemShuttingDown, __ATOMIC_ACQUIRE)) return;
+	}
 	if (gInFileInit) return;
 	gInFileInit = true;
 
@@ -320,7 +417,8 @@ static void krnldbgTryInitFile() {
 		// If still searching (volume not found), just reschedule
 		if (gVolumeSearchActive) {
 			SYSLOG("krnldbg", "Volume '%s' not yet mounted, retrying...", gTargetVolumeName);
-			if (gLogInitTimer) { gLogInitTimer->setTimeoutMS(gLogRetryMs); if (gLogRetryMs < 30000) gLogRetryMs <<= 1; }
+			// Use shorter interval during active volume search (2s), not exponential backoff
+			if (gLogInitTimer) gLogInitTimer->setTimeoutMS(2000);
 			gInFileInit = false;
 			return;
 		}
@@ -382,20 +480,15 @@ static bool krnldbgMatchVolumeBase(const char *base, const char *target) {
 	const char *suffix = base + targetLen;
 	if (suffix[0] == '\0') return true;
 
-	// Allow numbered variants: "name 1", "name 2", ...
-	if (suffix[0] == ' ' && krnldbgIsDigit(suffix[1])) {
-		suffix++;
-		while (*suffix) {
-			if (!krnldbgIsDigit(*suffix)) return false;
-			suffix++;
-		}
-		return true;
-	}
+	// DO NOT accept numbered variants like "USB 1" - these are usually autofs phantoms
+	// or indicate the real volume mounted with a different name due to a conflict.
+	// If user's volume IS named "Something 1", they should specify that exactly.
 
-	// Allow APFS data volume suffix: "name - Data" and "name - Data 1"
+	// Only allow APFS data volume suffix: "name - Data"
 	if (strncmp(suffix, " - Data", 7) == 0) {
 		suffix += 7;
 		if (suffix[0] == '\0') return true;
+		// Also allow "name - Data 1" etc for APFS edge cases
 		if (suffix[0] == ' ' && krnldbgIsDigit(suffix[1])) {
 			suffix++;
 			while (*suffix) {
@@ -459,35 +552,53 @@ static int krnldbgVolumeIterate(mount_t mp, void *arg) {
 	const char *mnt = st->f_mntonname;
 	if (!mnt || !mnt[0]) return VFS_RETURNED;
 
-	// Reject mounts that are not fully ready for writing
+	// Get mount flags and filesystem type for filtering
 	uint64_t mntflags = vfs_flags(mp);
-
-	// Must be read-write
-	if (mntflags & MNT_RDONLY) return VFS_RETURNED;
-
-	// Must be a local filesystem (not network)
-	if (!(mntflags & MNT_LOCAL)) return VFS_RETURNED;
-
-	// Reject autofs trigger mounts (transient placeholders before real mount)
 	char fstype[16] = {0};
 	vfs_name(mp, fstype);
-	if (strcmp(fstype, "autofs") == 0) return VFS_RETURNED;
+
+	// Log all mounts for debugging (only when volume search is active)
+	const char *base = krnldbgBasename(mnt);
+	DBGLOG("krnldbg", "VFS iter: '%s' (%s) flags=0x%llx blocks=%llu",
+	       mnt, fstype, mntflags, (unsigned long long)st->f_blocks);
+
+	// Must be read-write
+	if (mntflags & MNT_RDONLY) {
+		DBGLOG("krnldbg", "  -> skipped: read-only");
+		return VFS_RETURNED;
+	}
+
+	// Reject autofs trigger mounts (transient placeholders before real mount)
+	if (strcmp(fstype, "autofs") == 0) {
+		DBGLOG("krnldbg", "  -> skipped: autofs");
+		return VFS_RETURNED;
+	}
 
 	// Require actual backing storage (autofs/placeholders report zero blocks)
-	if (st->f_blocks == 0 || st->f_bsize == 0) return VFS_RETURNED;
+	if (st->f_blocks == 0 || st->f_bsize == 0) {
+		DBGLOG("krnldbg", "  -> skipped: no storage");
+		return VFS_RETURNED;
+	}
 
+	// Check if this matches our target
 	if (ctx->targetBsd && ctx->targetBsd[0]) {
 		const char *from = st->f_mntfromname;
 		if (!from || !from[0]) return VFS_RETURNED;
 		const char *fromBase = krnldbgBasename(from);
 		const char *target = krnldbgNormalizeBsdName(ctx->targetBsd);
-		if (strcmp(fromBase, target) != 0) return VFS_RETURNED;
+		if (strcmp(fromBase, target) != 0) {
+			DBGLOG("krnldbg", "  -> skipped: BSD mismatch '%s' != '%s'", fromBase, target);
+			return VFS_RETURNED;
+		}
 	} else {
 		if (!ctx->targetName || !ctx->targetName[0]) return VFS_RETURNED;
-		const char *base = krnldbgBasename(mnt);
-		if (!krnldbgMatchVolumeBase(base, ctx->targetName)) return VFS_RETURNED;
+		if (!krnldbgMatchVolumeBase(base, ctx->targetName)) {
+			DBGLOG("krnldbg", "  -> skipped: name mismatch '%s' != '%s'", base, ctx->targetName);
+			return VFS_RETURNED;
+		}
 	}
 
+	SYSLOG("krnldbg", "Volume match found: %s", mnt);
 	strlcpy(ctx->outPath, mnt, ctx->outPathSize);
 	strlcat(ctx->outPath, ctx->relPath, ctx->outPathSize);
 	ctx->found = true;
@@ -520,6 +631,9 @@ static void krnldbgSearchVolume() {
 	if (vfs_iterate(0, krnldbgVolumeIterate, &ctx) == 0 && ctx.found) {
 		SYSLOG("krnldbg", "Found target mount at %s", gLogFilePath);
 		gVolumeSearchActive = false;
+		// Update IORegistry dump path to match new log path location
+		krnldbgUpdateIORegDumpPath();
+		SYSLOG("krnldbg", "IORegistry dump path updated: %s", gIORegDumpPath);
 		if (ctx.ctxt) vfs_context_rele(ctx.ctxt);
 		return;
 	}
@@ -573,22 +687,450 @@ static void hookedConsoleWrite(const char *buf, int len) {
 	origConsoleWrite(buf, len);
 }
 
+// IORegistry dump: recursively serialize registry tree
+static void krnldbgDumpIORegistryEntry(IORegistryEntry *entry,
+                                        const IORegistryPlane *plane,
+                                        int depth,
+                                        char *outBuf,
+                                        size_t *outPos,
+                                        size_t outMax) {
+	if (!entry || *outPos >= outMax - 2048) return;
+
+	// Indent based on depth
+	for (int i = 0; i < depth && *outPos < outMax - 4; i++) {
+		outBuf[(*outPos)++] = ' ';
+		outBuf[(*outPos)++] = ' ';
+	}
+
+	// Get entry name and class
+	const char *name = entry->getName(plane);
+	if (!name) name = "(unnamed)";
+	const char *className = entry->getMetaClass() ? entry->getMetaClass()->getClassName() : "?";
+
+	// Write entry header
+	int written = snprintf(outBuf + *outPos, outMax - *outPos,
+	                       "+-o %s  <class %s>\n", name, className);
+	if (written > 0 && (size_t)written < outMax - *outPos) *outPos += written;
+
+	// Serialize properties
+	OSDictionary *props = entry->dictionaryWithProperties();
+	if (props) {
+		OSSerialize *s = OSSerialize::withCapacity(8192);
+		if (s) {
+			if (props->serialize(s)) {
+				const char *xml = s->text();
+				if (xml) {
+					size_t xmlLen = strlen(xml);
+					// Indent property block
+					for (int i = 0; i < depth + 1 && *outPos < outMax - 4; i++) {
+						outBuf[(*outPos)++] = ' ';
+						outBuf[(*outPos)++] = ' ';
+					}
+					int propHdr = snprintf(outBuf + *outPos, outMax - *outPos,
+					                       "{ properties: %zu bytes }\n", xmlLen);
+					if (propHdr > 0 && (size_t)propHdr < outMax - *outPos) *outPos += propHdr;
+
+					// Write full properties (no truncation)
+					if (*outPos + xmlLen + 4 < outMax) {
+						memcpy(outBuf + *outPos, xml, xmlLen);
+						*outPos += xmlLen;
+						outBuf[(*outPos)++] = '\n';
+					} else if (*outPos + 64 < outMax) {
+						// Buffer nearly full, note how much we couldn't fit
+						int skip = snprintf(outBuf + *outPos, outMax - *outPos,
+						                    "[buffer full, skipped %zu bytes]\n", xmlLen);
+						if (skip > 0) *outPos += skip;
+					}
+				}
+			}
+			s->release();
+		}
+		props->release();
+	}
+
+	// Recurse into children
+	OSIterator *childIter = entry->getChildIterator(plane);
+	if (childIter) {
+		IORegistryEntry *child;
+		while ((child = OSDynamicCast(IORegistryEntry, childIter->getNextObject()))) {
+			krnldbgDumpIORegistryEntry(child, plane, depth + 1, outBuf, outPos, outMax);
+		}
+		childIter->release();
+	}
+}
+
+static void krnldbgTriggerIORegDump() {
+	// Don't attempt file operations during shutdown
+	if (__c11_atomic_load(&gSystemShuttingDown, __ATOMIC_ACQUIRE)) {
+		SYSLOG("krnldbg", "IORegistry dump skipped: system shutting down");
+		return;
+	}
+
+	// Prevent concurrent dumps
+	if (__c11_atomic_exchange(&gDumpInProgress, 1, __ATOMIC_ACQUIRE)) {
+		SYSLOG("krnldbg", "IORegistry dump already in progress, skipping");
+		return;
+	}
+
+	// Allocate large buffer (IORegistry can be 20-50MB without truncation)
+	const size_t kDumpBufSize = 64 * 1024 * 1024;  // 64MB
+	char *dumpBuf = (char *)IOMalloc(kDumpBufSize);
+	if (!dumpBuf) {
+		SYSLOG("krnldbg", "Failed to allocate IORegistry dump buffer");
+		__c11_atomic_store(&gDumpInProgress, 0, __ATOMIC_RELEASE);
+		return;
+	}
+
+	size_t dumpPos = 0;
+
+	// Write header with timestamp
+	clock_sec_t secs; clock_usec_t usecs;
+	clock_get_system_microtime(&secs, &usecs);
+	int hdr = snprintf(dumpBuf, kDumpBufSize,
+	                   "IORegistry Dump at %llu.%06u\n"
+	                   "======================================\n\n",
+	                   (unsigned long long)secs, (unsigned)usecs);
+	if (hdr > 0) dumpPos = hdr;
+
+	// Get registry root and dump the tree
+	IORegistryEntry *root = IORegistryEntry::getRegistryRoot();
+	if (root) {
+		krnldbgDumpIORegistryEntry(root, gIOServicePlane, 0, dumpBuf, &dumpPos, kDumpBufSize);
+	} else {
+		SYSLOG("krnldbg", "Failed to get IORegistry root");
+	}
+
+	// Write to file (but avoid /Volumes paths if volume not ready - would create phantom mounts)
+	if (dumpPos > 0 && gIORegDumpPath[0]) {
+		bool canWrite = true;
+		if (strncmp(gIORegDumpPath, "/Volumes/", 9) == 0 && !gLogReady) {
+			SYSLOG("krnldbg", "IORegistry dump skipped: volume not ready yet");
+			canWrite = false;
+		}
+		if (canWrite) {
+			int err = FileIO::writeBufferToFile(gIORegDumpPath, dumpBuf, dumpPos,
+			                                     O_WRONLY | O_CREAT | O_TRUNC,
+			                                     S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+			if (err == 0) {
+				SYSLOG("krnldbg", "IORegistry dumped to %s (%zu bytes)", gIORegDumpPath, dumpPos);
+			} else {
+				SYSLOG("krnldbg", "Failed to write IORegistry dump (err=%d)", err);
+			}
+		}
+	}
+
+	IOFree(dumpBuf, kDumpBufSize);
+	__c11_atomic_store(&gDumpInProgress, 0, __ATOMIC_RELEASE);
+}
+
+// Dump loaded kexts (similar to kextstat | grep -v com.apple)
+static void krnldbgTriggerKextDump() {
+	// Don't attempt file operations during shutdown
+	if (__c11_atomic_load(&gSystemShuttingDown, __ATOMIC_ACQUIRE)) {
+		SYSLOG("krnldbg", "Kext dump skipped: system shutting down");
+		return;
+	}
+
+	// Prevent concurrent dumps
+	if (__c11_atomic_exchange(&gKextDumpInProgress, 1, __ATOMIC_ACQUIRE)) {
+		SYSLOG("krnldbg", "Kext dump already in progress, skipping");
+		return;
+	}
+
+	// Allocate buffer for output
+	const size_t kBufSize = 256 * 1024;  // 256KB should be plenty
+	char *dumpBuf = (char *)IOMalloc(kBufSize);
+	if (!dumpBuf) {
+		SYSLOG("krnldbg", "Failed to allocate kext dump buffer");
+		__c11_atomic_store(&gKextDumpInProgress, 0, __ATOMIC_RELEASE);
+		return;
+	}
+
+	size_t dumpPos = 0;
+
+	// Write header
+	clock_sec_t secs; clock_usec_t usecs;
+	clock_get_system_microtime(&secs, &usecs);
+	int hdr = snprintf(dumpBuf, kBufSize,
+	                   "Loaded Kexts (non-Apple) at %llu.%06u\n"
+	                   "==========================================\n"
+	                   "Index  Refs  Address             Size        Name (Version)\n"
+	                   "-----  ----  ------------------  ----------  --------------\n",
+	                   (unsigned long long)secs, (unsigned)usecs);
+	if (hdr > 0) dumpPos = hdr;
+
+	// Get loaded kext info
+	// gcopyLoadedKextInfo returns a dictionary keyed by bundle ID (resolved at runtime)
+	OSDictionary *kextInfo = nullptr;
+	if (gcopyLoadedKextInfo) {
+		kextInfo = gcopyLoadedKextInfo(nullptr, nullptr);
+	}
+
+	if (kextInfo) {
+		OSCollectionIterator *iter = OSCollectionIterator::withCollection(kextInfo);
+		if (iter) {
+			int index = 0;
+			OSString *bundleID;
+			while ((bundleID = OSDynamicCast(OSString, iter->getNextObject()))) {
+				const char *idStr = bundleID->getCStringNoCopy();
+				if (!idStr) continue;
+
+				// Skip com.apple.* kexts
+				if (strncmp(idStr, "com.apple.", 10) == 0) continue;
+
+				OSDictionary *info = OSDynamicCast(OSDictionary, kextInfo->getObject(bundleID));
+				if (!info) continue;
+
+				// Get version
+				const char *version = "?";
+				OSString *verStr = OSDynamicCast(OSString, info->getObject("CFBundleVersion"));
+				if (verStr) version = verStr->getCStringNoCopy();
+
+				// Get load address
+				uint64_t loadAddr = 0;
+				OSNumber *addrNum = OSDynamicCast(OSNumber, info->getObject("OSBundleLoadAddress"));
+				if (addrNum) loadAddr = addrNum->unsigned64BitValue();
+
+				// Get size
+				uint64_t loadSize = 0;
+				OSNumber *sizeNum = OSDynamicCast(OSNumber, info->getObject("OSBundleLoadSize"));
+				if (sizeNum) loadSize = sizeNum->unsigned64BitValue();
+
+				// Get reference count
+				uint32_t refs = 0;
+				OSNumber *refNum = OSDynamicCast(OSNumber, info->getObject("OSBundleRetainCount"));
+				if (refNum) refs = refNum->unsigned32BitValue();
+
+				// Format line
+				int written = snprintf(dumpBuf + dumpPos, kBufSize - dumpPos,
+				                       "%5d  %4u  0x%016llx  %10llu  %s (%s)\n",
+				                       index, refs, loadAddr, loadSize, idStr, version);
+				if (written > 0 && dumpPos + written < kBufSize) {
+					dumpPos += written;
+				}
+				index++;
+			}
+			iter->release();
+		}
+		kextInfo->release();
+	} else {
+		int written = snprintf(dumpBuf + dumpPos, kBufSize - dumpPos,
+		                       "(Failed to get kext info)\n");
+		if (written > 0) dumpPos += written;
+	}
+
+	// Write footer with count
+	int footer = snprintf(dumpBuf + dumpPos, kBufSize - dumpPos,
+	                      "\n==========================================\n");
+	if (footer > 0 && dumpPos + footer < kBufSize) dumpPos += footer;
+
+	// Write to file
+	if (dumpPos > 0 && gKextDumpPath[0]) {
+		bool canWrite = true;
+		if (strncmp(gKextDumpPath, "/Volumes/", 9) == 0 && !gLogReady) {
+			SYSLOG("krnldbg", "Kext dump skipped: volume not ready yet");
+			canWrite = false;
+		}
+		if (canWrite) {
+			int err = FileIO::writeBufferToFile(gKextDumpPath, dumpBuf, dumpPos,
+			                                     O_WRONLY | O_CREAT | O_TRUNC,
+			                                     S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+			if (err == 0) {
+				SYSLOG("krnldbg", "Kext list dumped to %s (%zu bytes)", gKextDumpPath, dumpPos);
+			} else {
+				SYSLOG("krnldbg", "Failed to write kext dump (err=%d)", err);
+			}
+		}
+	}
+
+	IOFree(dumpBuf, kBufSize);
+	__c11_atomic_store(&gKextDumpInProgress, 0, __ATOMIC_RELEASE);
+}
+
+static void krnldbgScheduleKextDump() {
+	// Schedule dump on workloop for thread safety
+	if (gLogWorkLoop) {
+		IOTimerEventSource *dumpTimer = IOTimerEventSource::timerEventSource(
+			gLogWorkLoop,
+			[](OSObject *, IOTimerEventSource *timer) {
+				krnldbgTriggerKextDump();
+				if (timer) {
+					timer->cancelTimeout();
+					gLogWorkLoop->removeEventSource(timer);
+					timer->release();
+				}
+			}
+		);
+		if (dumpTimer && gLogWorkLoop->addEventSource(dumpTimer) == kIOReturnSuccess) {
+			dumpTimer->setTimeoutMS(1);
+			dumpTimer->enable();
+			return;
+		}
+		if (dumpTimer) dumpTimer->release();
+	}
+	// Fallback: synchronous dump
+	krnldbgTriggerKextDump();
+}
+
+static void krnldbgScheduleIORegDump() {
+	// Schedule dump on workloop for thread safety (avoid interrupt context)
+	if (gLogWorkLoop) {
+		IOTimerEventSource *dumpTimer = IOTimerEventSource::timerEventSource(
+			gLogWorkLoop,
+			[](OSObject *, IOTimerEventSource *timer) {
+				krnldbgTriggerIORegDump();
+				if (timer) {
+					timer->cancelTimeout();
+					gLogWorkLoop->removeEventSource(timer);
+					timer->release();
+				}
+			}
+		);
+		if (dumpTimer && gLogWorkLoop->addEventSource(dumpTimer) == kIOReturnSuccess) {
+			dumpTimer->setTimeoutMS(1);  // Execute ASAP
+			dumpTimer->enable();
+			return;
+		}
+		if (dumpTimer) dumpTimer->release();
+	}
+	// Fallback: synchronous dump
+	krnldbgTriggerIORegDump();
+}
+
+// Keyboard event hook for specified hotkeys (hooks IOHIDEventService::dispatchKeyboardEvent)
+// Signature: dispatchKeyboardEvent(timestamp, usagePage, usage, value, options)
+static void hookedDispatchKeyboardEvent(IOHIDEventService *self,
+                                         unsigned long long timestamp,
+                                         unsigned usagePage,
+                                         unsigned usage,
+                                         unsigned value,
+                                         unsigned options) {
+	// Only process keyboard page (0x07)
+	if (usagePage == 0x07) {
+		// Debug: log key events if keylog was enabled at boot (cached, not checked per-event)
+		if (gHIDKeyLogEnabled) {
+			DBGLOG("krnldbg", "HID Key: usage=0x%x value=%u options=0x%x", usage, value, options);
+		}
+
+		// Track modifier state
+		if (usage == kHIDUsage_KeyboardLeftControl || usage == kHIDUsage_KeyboardRightControl) {
+			if (value) __c11_atomic_fetch_or(&gModifierState, kModCtrl, __ATOMIC_RELAXED);
+			else __c11_atomic_fetch_and(&gModifierState, ~kModCtrl, __ATOMIC_RELAXED);
+		}
+		if (usage == kHIDUsage_KeyboardLeftShift || usage == kHIDUsage_KeyboardRightShift) {
+			if (value) __c11_atomic_fetch_or(&gModifierState, kModShift, __ATOMIC_RELAXED);
+			else __c11_atomic_fetch_and(&gModifierState, ~kModShift, __ATOMIC_RELAXED);
+		}
+
+		// Check for Ctrl+Shift+D hotkey (D key pressed)
+		if (gHotkeyEnabled && value == 1 && usage == kHIDUsage_KeyboardD) {
+			unsigned mods = __c11_atomic_load(&gModifierState, __ATOMIC_RELAXED);
+			if ((mods & (kModCtrl | kModShift)) == (kModCtrl | kModShift)) {
+				// Debounce check (2 seconds between dumps)
+				uint64_t now = mach_absolute_time();
+				uint64_t last = __c11_atomic_load(&gLastDumpTime, __ATOMIC_RELAXED);
+
+				if (now - last > kDumpDebounceNs) {
+					if (__c11_atomic_compare_exchange_strong(&gLastDumpTime, &last, now,
+					                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+						SYSLOG("krnldbg", "Hotkey Ctrl+Shift+D detected, triggering IORegistry dump");
+						krnldbgScheduleIORegDump();
+					}
+				}
+			}
+		}
+
+		// Check for Ctrl+Shift+K hotkey (K key pressed) - kextstat dump
+		if (gHotkeyEnabled && value == 1 && usage == kHIDUsage_KeyboardK) {
+			unsigned mods = __c11_atomic_load(&gModifierState, __ATOMIC_RELAXED);
+			if ((mods & (kModCtrl | kModShift)) == (kModCtrl | kModShift)) {
+				uint64_t now = mach_absolute_time();
+				uint64_t last = __c11_atomic_load(&gLastKextDumpTime, __ATOMIC_RELAXED);
+
+				if (now - last > kDumpDebounceNs) {
+					if (__c11_atomic_compare_exchange_strong(&gLastKextDumpTime, &last, now,
+					                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+						SYSLOG("krnldbg", "Hotkey Ctrl+Shift+K detected, triggering kext list dump");
+						krnldbgScheduleKextDump();
+					}
+				}
+			}
+		}
+	}
+	if (origDispatchKeyboardEvent) {
+		origDispatchKeyboardEvent(self, timestamp, usagePage, usage, value, options);
+	}
+}
+
 static void routeLogs(KernelPatcher &patcher) {
 	// Hook the required logging function
 	KernelPatcher::RouteRequest reqs[] {
 		KernelPatcher::RouteRequest("_console_write", hookedConsoleWrite, reinterpret_cast<mach_vm_address_t &>(origConsoleWrite))
 	};
-	
+
 	if (!patcher.routeMultiple(KernelPatcher::KernelID, reqs, arrsize(reqs))) {
 		SYSLOG("krnldbg", "Failed to route some log symbols");
 	} else {
 		SYSLOG("krnldbg", "Hooked all necessary log symbols");
+	}
+
+	// Resolve copyLoadedKextInfo for kextstat dump
+	mach_vm_address_t kextInfoAddr = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN6OSKext18copyLoadedKextInfoEP7OSArrayS1_");
+	if (!kextInfoAddr) {
+		// Fallback to older symbol name (first symbol should be present on most cases)
+		kextInfoAddr = patcher.solveSymbol(KernelPatcher::KernelID, "_OSKextCopyLoadedKextInfo");
+	}
+	if (kextInfoAddr) {
+		gcopyLoadedKextInfo = reinterpret_cast<copyLoadedKextInfoFunc>(kextInfoAddr);
+		SYSLOG("krnldbg", "Resolved copyLoadedKextInfo for kextstat dump");
+	} else {
+		SYSLOG("krnldbg", "Failed to resolve copyLoadedKextInfo, Ctrl+Shift+K disabled");
+	}
+}
+
+// Kext load callback for IOHIDFamily - hooks keyboard events
+static void onIOHIDFamilyLoad(void *user, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (!gHotkeyEnabled) return;
+
+	// Guard against double-hooking (callback may fire multiple times)
+	if (origDispatchKeyboardEvent) return;
+
+	SYSLOG("krnldbg", "IOHIDFamily detected, installing keyboard hook");
+
+	KernelPatcher::RouteRequest kbdReqs[] {
+		KernelPatcher::RouteRequest("__ZN17IOHIDEventService21dispatchKeyboardEventEyjjjj",
+		                            hookedDispatchKeyboardEvent,
+		                            reinterpret_cast<mach_vm_address_t &>(origDispatchKeyboardEvent))
+	};
+
+	if (!patcher.routeMultiple(index, kbdReqs, arrsize(kbdReqs))) {
+		SYSLOG("krnldbg", "Failed to hook keyboard event in IOHIDFamily, hotkeys disabled");
+		gHotkeyEnabled = false;
+	} else {
+		SYSLOG("krnldbg", "Keyboard hook installed successfully in IOHIDFamily");
 	}
 }
 
 // Patcher load callback to obtain KernelPatcher instance
 static void onPatcherLoad(void *user, KernelPatcher &patcher) {
 	routeLogs(patcher);
+
+	// Keyboard hotkey: check boot arg to disable
+	if (checkKernelArgument("-krnldbgnohotkey")) {
+		gHotkeyEnabled = false;
+		kIOHIDFamilyInfo.switchOff();
+		SYSLOG("krnldbg", "Hotkey detection disabled by boot arg");
+	}
+
+	// Cache HID key logging setting (expensive to check per-event)
+	gHIDKeyLogEnabled = checkKernelArgument("-krnldbgkeylog");
+	if (gHIDKeyLogEnabled) {
+		SYSLOG("krnldbg", "HID key logging enabled (may leak sensitive info, use with caution)");
+	}
+
+	// Cache shutdown wait skip setting (checked frequently in flush path)
+	gSkipShutdownWait = checkKernelArgument("-krnldbgskipwait");
+
 	if (checkKernelArgument("-krnldbglogdisable")) gFileLoggingEnabled = false;
 	if (checkKernelArgument("-krnldbglogtmp")) {
 		strlcpy(gLogFilePath, "/private/var/tmp/krnl.log", sizeof(gLogFilePath));
@@ -708,6 +1250,11 @@ static void onPatcherLoad(void *user, KernelPatcher &patcher) {
 		strlcpy(gLogFilePath, remap, sizeof(gLogFilePath));
 		SYSLOG("krnldbg", "Remapped log path to %s", gLogFilePath);
 	}
+	// Compute IORegistry dump path from log path (same directory, ioreg_dump.txt)
+	if (gHotkeyEnabled && gLogFilePath[0]) {
+		krnldbgUpdateIORegDumpPath();
+		SYSLOG("krnldbg", "IORegistry dump path: %s", gIORegDumpPath);
+	}
 	// Allocate log buffer now (after potential resize)
 	// Validate final size bounds
 	if (gLogBufSize < kLogBufMin) gLogBufSize = kLogBufMin;
@@ -762,6 +1309,51 @@ static void onPatcherLoad(void *user, KernelPatcher &patcher) {
 			}
 			gLogWorkLoop->release();
 		}
+
+		// Register for power management events (shutdown/restart detection)
+		// IOPMrootDomain may not be available during early boot, so use a timer to retry
+		IOTimerEventSource *powerRegTimer = IOTimerEventSource::timerEventSource(gLogWorkLoop,
+			[](OSObject *, IOTimerEventSource *timer) {
+				if (gPowerNotifier) {
+					// Already registered
+					if (timer) {
+						timer->cancelTimeout();
+						gLogWorkLoop->removeEventSource(timer);
+						timer->release();
+					}
+					return;
+				}
+
+				// Find IOPMrootDomain by class name
+				OSDictionary *matching = IOService::serviceMatching("IOPMrootDomain");
+				if (matching) {
+					IOService *rootDomain = IOService::copyMatchingService(matching);
+					matching->release();
+					if (rootDomain) {
+						gPowerNotifier = rootDomain->registerInterest(gIOPriorityPowerStateInterest,
+						                                               krnldbgPowerEventHandler, nullptr, nullptr);
+						rootDomain->release();
+						if (gPowerNotifier) {
+							SYSLOG("krnldbg", "Registered for power events");
+							if (timer) {
+								timer->cancelTimeout();
+								gLogWorkLoop->removeEventSource(timer);
+								timer->release();
+							}
+							return;
+						}
+					}
+				}
+				// Retry in 2 seconds
+				if (timer) timer->setTimeoutMS(2000);
+			}
+		);
+		if (powerRegTimer && gLogWorkLoop->addEventSource(powerRegTimer) == kIOReturnSuccess) {
+			powerRegTimer->setTimeoutMS(1000);  // First attempt after 1 second
+			powerRegTimer->enable();
+		} else {
+			if (powerRegTimer) powerRegTimer->release();
+		}
 	}
 }
 
@@ -777,15 +1369,16 @@ PluginConfiguration ADDPR(config) {
 	parseModuleVersion(xStringify(MODULE_VERSION)),
 	LiluAPI::AllowNormal | LiluAPI::AllowInstallerRecovery | LiluAPI::AllowSafeMode,
 	krnldbgoff,
-	1,
+	arrsize(krnldbgoff),
 	krnldbgdebug,
-	1,
+	arrsize(krnldbgdebug),
 	krnldbgbeta,
-	1,
+	arrsize(krnldbgbeta),
 	KernelVersion::Monterey,
 	KernelVersion::Tahoe,
 	[]() {
 		lilu.onPatcherLoadForce(onPatcherLoad);
+		lilu.onKextLoadForce(&kIOHIDFamilyInfo, 1, onIOHIDFamilyLoad);
 		Krnldbg.init();
 	}
 };
