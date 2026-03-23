@@ -39,6 +39,7 @@ This kext comes with a number of boot arguments to control its behavior. Add the
 - `-krnldbgkeylog`: Log HID keyboard input (may include sensitive data, use with caution).
 - `-krnldbgskipwait`: Ignores shutdown checks in the log flushing function, allowing it to run even during shutdown.
 - `krnldbgnohotkey`: Disable hotkey support for triggering various diagnotic actions.
+- `-krnldbglogfulldata`: Disable truncation of large OSData blobs in IORegistry logs, showing the full content instead (may cause very large log entries).
 
 #### Keyboard hotkeys
 

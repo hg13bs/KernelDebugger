@@ -108,9 +108,10 @@ static uint32_t gLogInitUptimeSecMin = 5;  // do not attempt file IO before this
 static uint32_t gFlushErrors = 0;          // consecutive flush write errors
 static bool gForcedTmpPath = false;        // boot arg -krnldbglogtmp forces /private/var/tmp path
 static bool gOpportunisticFlush = false;   // optional immediate flush on log writes
-static _Atomic(bool) gSystemShuttingDown = false; // set during shutdown/restart to prevent file ops
+static _Atomic(bool) gSystemShuttingDown = false;  // set during shutdown/restart to prevent file ops
 static IONotifier *gPowerNotifier = nullptr;       // power management notifier
 static bool gSkipShutdownWait = false;             // cached from -krnldbgskipwait boot arg
+static bool gSkipDataTruncation = false;           // cached from -krnldbglogfulldata boot arg
 static void krnldbgFlushToFile(bool force);        // forward declaration
 
 // Power event callback - detect shutdown/restart
@@ -143,6 +144,7 @@ static char gTargetRelPath[160] = "/krnl.log"; // relative path under target vol
 static bool gVolumeSearchActive = false;   // whether we're searching for a volume
 static _Atomic(uint32_t) gVolumeSearchAttempts = 0; // number of search passes
 static uint32_t gMaxVolumeSearchAttemptsBeforeFallback = 60; // after ~60 timer passes (~progressive seconds) fallback to /private/var/tmp
+static bool gStalePlaceholderDetected = false;  // tracks if /Volumes/<target> is a stale directory (not a mount)
 static void krnldbgTryInitFile();          // forward declaration
 static void krnldbgSearchVolume();         // forward declaration
 static bool krnldbgParseVolumePath(const char *path, char *outVol, size_t outVolSize, char *outRel, size_t outRelSize);
@@ -480,11 +482,21 @@ static bool krnldbgMatchVolumeBase(const char *base, const char *target) {
 	const char *suffix = base + targetLen;
 	if (suffix[0] == '\0') return true;
 
-	// DO NOT accept numbered variants like "USB 1" - these are usually autofs phantoms
-	// or indicate the real volume mounted with a different name due to a conflict.
-	// If user's volume IS named "Something 1", they should specify that exactly.
+	// Accept numbered variants like "USB 1" when a stale placeholder exists
+	// This handles the case where macOS renamed the volume due to a conflict
+	if (gStalePlaceholderDetected && suffix[0] == ' ' && krnldbgIsDigit(suffix[1])) {
+		const char *p = suffix + 1;
+		while (*p) {
+			if (!krnldbgIsDigit(*p)) break;
+			p++;
+		}
+		if (*p == '\0') {
+			SYSLOG("krnldbg", "Accepting numbered variant '%s' for target '%s' (stale placeholder exists)", base, target);
+			return true;
+		}
+	}
 
-	// Only allow APFS data volume suffix: "name - Data"
+	// Allow APFS data volume suffix: "name - Data"
 	if (strncmp(suffix, " - Data", 7) == 0) {
 		suffix += 7;
 		if (suffix[0] == '\0') return true;
@@ -607,11 +619,67 @@ static int krnldbgVolumeIterate(mount_t mp, void *arg) {
 
 // Search for target volume via mounted filesystem list
 // Handles volume name variations like "test", "test 1", "test 2" and "test - Data"
+// Check if a path exists and is NOT a mount point (just a directory on the parent filesystem)
+// This detects stale placeholder directories in /Volumes
+static bool krnldbgIsStaleVolumeDir(const char *volName) {
+	if (!volName || !volName[0]) return false;
+
+	char path[256];
+	snprintf(path, sizeof(path), "/Volumes/%s", volName);
+
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	if (!ctx) return false;
+
+	vnode_t vp = NULLVP;
+	errno_t err = vnode_lookup(path, 0, &vp, ctx);
+	if (err || !vp) {
+		vfs_context_rele(ctx);
+		return false; // Path doesn't exist
+	}
+
+	// Check if this is a directory
+	if (!vnode_isdir(vp)) {
+		vnode_put(vp);
+		vfs_context_rele(ctx);
+		return false;
+	}
+
+	// Check if anything is mounted here by comparing mount points
+	// If the directory's mount is the same as /Volumes, it's not a separate mount
+	mount_t volMnt = vnode_mount(vp);
+	vnode_put(vp);
+
+	// Look up /Volumes to compare
+	vnode_t volumesVp = NULLVP;
+	err = vnode_lookup("/Volumes", 0, &volumesVp, ctx);
+	if (err || !volumesVp) {
+		vfs_context_rele(ctx);
+		return false;
+	}
+
+	mount_t volumesMnt = vnode_mount(volumesVp);
+	vnode_put(volumesVp);
+	vfs_context_rele(ctx);
+
+	// If they're on the same mount, /Volumes/USB is just a placeholder directory
+	bool isStale = (volMnt == volumesMnt);
+	if (isStale) {
+		SYSLOG("krnldbg", "Detected stale placeholder directory: %s", path);
+	}
+	return isStale;
+}
+
 static void krnldbgSearchVolume() {
 	if (!gVolumeSearchActive || (gTargetVolumeName[0] == '\0' && gTargetBSDName[0] == '\0')) return;
 	if (gLogReady) return; // already found
 
 	uint32_t attempt = __c11_atomic_fetch_add(&gVolumeSearchAttempts, 1, __ATOMIC_RELAXED);
+
+	// On first few attempts, check for stale placeholder directories
+	// that might cause macOS to rename the real volume (e.g., "USB" -> "USB 1")
+	if (attempt <= 3 && gTargetVolumeName[0] && !gStalePlaceholderDetected) {
+		gStalePlaceholderDetected = krnldbgIsStaleVolumeDir(gTargetVolumeName);
+	}
 	if ((attempt % 10) == 1) { // periodic progress
 		if (gTargetBSDName[0]) {
 			SYSLOG("krnldbg", "Mount search attempt %u for BSD '%s'", attempt, gTargetBSDName);
@@ -687,7 +755,180 @@ static void hookedConsoleWrite(const char *buf, int len) {
 	origConsoleWrite(buf, len);
 }
 
-// IORegistry dump: recursively serialize registry tree
+// IORegistry dump: pretty-print helpers (ioreg -l style)
+
+// Write tree prefix: "  |   |   " based on depth
+static void krnldbgWriteTreePrefix(int depth, char *outBuf, size_t *outPos, size_t outMax, bool withBar = true) {
+	for (int i = 0; i < depth && *outPos < outMax - 4; i++) {
+		outBuf[(*outPos)++] = ' ';
+		outBuf[(*outPos)++] = ' ';
+		if (withBar && i < depth - 1) {
+			outBuf[(*outPos)++] = '|';
+			outBuf[(*outPos)++] = ' ';
+		}
+	}
+}
+
+// Forward declaration for recursive formatting
+static void krnldbgFormatValue(OSObject *obj, char *outBuf, size_t *outPos, size_t outMax, int depth, bool compact);
+
+// Format OSData as <hex bytes> with optional truncation
+static void krnldbgFormatData(OSData *data, char *outBuf, size_t *outPos, size_t outMax) {
+	if (!data || *outPos >= outMax - 16) return;
+
+	unsigned int len = data->getLength();
+	const uint8_t *bytes = (const uint8_t *)data->getBytesNoCopy();
+
+	outBuf[(*outPos)++] = '<';
+
+	// Limit hex output for very large data blobs unless truncation is disabled.
+	unsigned int showLen = len;
+	bool truncated = false;
+	if (showLen > 64 && !gSkipDataTruncation) {
+		showLen = 64;
+		truncated = true;
+	}
+
+	for (unsigned int i = 0; i < showLen && *outPos < outMax - 8; i++) {
+		if (i > 0 && (i % 4) == 0) outBuf[(*outPos)++] = ' ';
+		int w = snprintf(outBuf + *outPos, outMax - *outPos, "%02x", bytes[i]);
+		if (w > 0) *outPos += w;
+	}
+
+	if (truncated && *outPos < outMax - 32) {
+		int w = snprintf(outBuf + *outPos, outMax - *outPos, "...%u total bytes", len);
+		if (w > 0) *outPos += w;
+	}
+
+	if (*outPos < outMax) outBuf[(*outPos)++] = '>';
+}
+
+// Format OSDictionary as {"key"=value,...} (compact) or multi-line
+static void krnldbgFormatDict(OSDictionary *dict, char *outBuf, size_t *outPos, size_t outMax, int depth, bool compact) {
+	if (!dict || *outPos >= outMax - 8) return;
+
+	outBuf[(*outPos)++] = '{';
+
+	OSIterator *iter = OSCollectionIterator::withCollection(dict);
+	if (iter) {
+		bool first = true;
+		OSSymbol *key;
+		while ((key = OSDynamicCast(OSSymbol, iter->getNextObject()))) {
+			OSObject *val = dict->getObject(key);
+			if (!val) continue;
+
+			if (!first) {
+				outBuf[(*outPos)++] = ',';
+			}
+			first = false;
+
+			// Write "key"=value
+			int w = snprintf(outBuf + *outPos, outMax - *outPos, "\"%s\"=", key->getCStringNoCopy());
+			if (w > 0) *outPos += w;
+
+			krnldbgFormatValue(val, outBuf, outPos, outMax, depth + 1, true);
+
+			if (*outPos >= outMax - 16) break;
+		}
+		iter->release();
+	}
+
+	if (*outPos < outMax) outBuf[(*outPos)++] = '}';
+}
+
+// Format OSArray as (item1,item2,...)
+static void krnldbgFormatArray(OSArray *arr, char *outBuf, size_t *outPos, size_t outMax, int depth) {
+	if (!arr || *outPos >= outMax - 8) return;
+
+	outBuf[(*outPos)++] = '(';
+
+	unsigned int count = arr->getCount();
+	for (unsigned int i = 0; i < count && *outPos < outMax - 16; i++) {
+		if (i > 0) outBuf[(*outPos)++] = ',';
+		OSObject *obj = arr->getObject(i);
+		if (obj) {
+			krnldbgFormatValue(obj, outBuf, outPos, outMax, depth + 1, true);
+		}
+	}
+
+	if (*outPos < outMax) outBuf[(*outPos)++] = ')';
+}
+
+// Format any OSObject value
+static void krnldbgFormatValue(OSObject *obj, char *outBuf, size_t *outPos, size_t outMax, int depth, bool compact) {
+	if (!obj || *outPos >= outMax - 32) return;
+
+	// OSString
+	if (OSString *str = OSDynamicCast(OSString, obj)) {
+		const char *cstr = str->getCStringNoCopy();
+		if (cstr) {
+			int w = snprintf(outBuf + *outPos, outMax - *outPos, "\"%s\"", cstr);
+			if (w > 0 && (size_t)w < outMax - *outPos) *outPos += w;
+		}
+		return;
+	}
+
+	// OSNumber
+	if (OSNumber *num = OSDynamicCast(OSNumber, obj)) {
+		unsigned long long val = num->unsigned64BitValue();
+		unsigned int bits = num->numberOfBits();
+		int w;
+		// Show small numbers as decimal, large as hex
+		if (val <= 9999999) {
+			w = snprintf(outBuf + *outPos, outMax - *outPos, "%llu", val);
+		} else if (bits <= 32) {
+			w = snprintf(outBuf + *outPos, outMax - *outPos, "0x%llx", val);
+		} else {
+			w = snprintf(outBuf + *outPos, outMax - *outPos, "0x%llx", val);
+		}
+		if (w > 0) *outPos += w;
+		return;
+	}
+
+	// OSBoolean
+	if (OSBoolean *b = OSDynamicCast(OSBoolean, obj)) {
+		const char *s = b->isTrue() ? "Yes" : "No";
+		int w = snprintf(outBuf + *outPos, outMax - *outPos, "%s", s);
+		if (w > 0) *outPos += w;
+		return;
+	}
+
+	// OSData
+	if (OSData *data = OSDynamicCast(OSData, obj)) {
+		krnldbgFormatData(data, outBuf, outPos, outMax);
+		return;
+	}
+
+	// OSDictionary (nested)
+	if (OSDictionary *dict = OSDynamicCast(OSDictionary, obj)) {
+		krnldbgFormatDict(dict, outBuf, outPos, outMax, depth, compact);
+		return;
+	}
+
+	// OSArray
+	if (OSArray *arr = OSDynamicCast(OSArray, obj)) {
+		krnldbgFormatArray(arr, outBuf, outPos, outMax, depth);
+		return;
+	}
+
+	// OSSymbol (treat like string)
+	if (OSSymbol *sym = OSDynamicCast(OSSymbol, obj)) {
+		const char *cstr = sym->getCStringNoCopy();
+		if (cstr) {
+			int w = snprintf(outBuf + *outPos, outMax - *outPos, "\"%s\"", cstr);
+			if (w > 0 && (size_t)w < outMax - *outPos) *outPos += w;
+		}
+		return;
+	}
+
+	// Unknown type - show class name
+	const OSMetaClass *mc = obj->getMetaClass();
+	const char *cn = mc ? mc->getClassName() : "?";
+	int w = snprintf(outBuf + *outPos, outMax - *outPos, "<%s>", cn);
+	if (w > 0) *outPos += w;
+}
+
+// IORegistry dump: recursively dump registry tree (ioreg -l style)
 static void krnldbgDumpIORegistryEntry(IORegistryEntry *entry,
                                         const IORegistryPlane *plane,
                                         int depth,
@@ -696,55 +937,62 @@ static void krnldbgDumpIORegistryEntry(IORegistryEntry *entry,
                                         size_t outMax) {
 	if (!entry || *outPos >= outMax - 2048) return;
 
-	// Indent based on depth
-	for (int i = 0; i < depth && *outPos < outMax - 4; i++) {
-		outBuf[(*outPos)++] = ' ';
-		outBuf[(*outPos)++] = ' ';
-	}
+	// Write tree prefix for entry line
+	krnldbgWriteTreePrefix(depth, outBuf, outPos, outMax, false);
 
 	// Get entry name and class
 	const char *name = entry->getName(plane);
 	if (!name) name = "(unnamed)";
 	const char *className = entry->getMetaClass() ? entry->getMetaClass()->getClassName() : "?";
 
-	// Write entry header
+	// Get registry entry ID (like ioreg shows)
+	uint64_t entryID = entry->getRegistryEntryID();
+
+	// Write entry header: +-o Name  <class ClassName, id 0xXXX, retain N>
 	int written = snprintf(outBuf + *outPos, outMax - *outPos,
-	                       "+-o %s  <class %s>\n", name, className);
+	                       "+-o %s  <class %s, id 0x%llx, retain %d>\n",
+	                       name, className, entryID, entry->getRetainCount());
 	if (written > 0 && (size_t)written < outMax - *outPos) *outPos += written;
 
-	// Serialize properties
+	// Get properties and format them
 	OSDictionary *props = entry->dictionaryWithProperties();
-	if (props) {
-		OSSerialize *s = OSSerialize::withCapacity(8192);
-		if (s) {
-			if (props->serialize(s)) {
-				const char *xml = s->text();
-				if (xml) {
-					size_t xmlLen = strlen(xml);
-					// Indent property block
-					for (int i = 0; i < depth + 1 && *outPos < outMax - 4; i++) {
-						outBuf[(*outPos)++] = ' ';
-						outBuf[(*outPos)++] = ' ';
-					}
-					int propHdr = snprintf(outBuf + *outPos, outMax - *outPos,
-					                       "{ properties: %zu bytes }\n", xmlLen);
-					if (propHdr > 0 && (size_t)propHdr < outMax - *outPos) *outPos += propHdr;
+	if (props && props->getCount() > 0) {
+		// Opening brace
+		krnldbgWriteTreePrefix(depth + 1, outBuf, outPos, outMax, true);
+		int w = snprintf(outBuf + *outPos, outMax - *outPos, "| {\n");
+		if (w > 0) *outPos += w;
 
-					// Write full properties (no truncation)
-					if (*outPos + xmlLen + 4 < outMax) {
-						memcpy(outBuf + *outPos, xml, xmlLen);
-						*outPos += xmlLen;
-						outBuf[(*outPos)++] = '\n';
-					} else if (*outPos + 64 < outMax) {
-						// Buffer nearly full, note how much we couldn't fit
-						int skip = snprintf(outBuf + *outPos, outMax - *outPos,
-						                    "[buffer full, skipped %zu bytes]\n", xmlLen);
-						if (skip > 0) *outPos += skip;
-					}
-				}
+		// Iterate properties
+		OSIterator *iter = OSCollectionIterator::withCollection(props);
+		if (iter) {
+			OSSymbol *key;
+			while ((key = OSDynamicCast(OSSymbol, iter->getNextObject()))) {
+				OSObject *val = props->getObject(key);
+				if (!val) continue;
+
+				// Write prefix and key
+				krnldbgWriteTreePrefix(depth + 1, outBuf, outPos, outMax, true);
+				w = snprintf(outBuf + *outPos, outMax - *outPos, "|   \"%s\" = ", key->getCStringNoCopy());
+				if (w > 0) *outPos += w;
+
+				// Write value
+				krnldbgFormatValue(val, outBuf, outPos, outMax, depth + 2, false);
+
+				// Newline
+				if (*outPos < outMax) outBuf[(*outPos)++] = '\n';
+
+				if (*outPos >= outMax - 256) break;
 			}
-			s->release();
+			iter->release();
 		}
+
+		// Closing brace
+		krnldbgWriteTreePrefix(depth + 1, outBuf, outPos, outMax, true);
+		w = snprintf(outBuf + *outPos, outMax - *outPos, "| }\n");
+		if (w > 0) *outPos += w;
+
+		props->release();
+	} else if (props) {
 		props->release();
 	}
 
@@ -1130,6 +1378,9 @@ static void onPatcherLoad(void *user, KernelPatcher &patcher) {
 
 	// Cache shutdown wait skip setting (checked frequently in flush path)
 	gSkipShutdownWait = checkKernelArgument("-krnldbgskipwait");
+
+	// Skip truncating OSData in IORegistry logs (show full data, may cause very large log entries)
+	gSkipDataTruncation = checkKernelArgument("-krnldbglogfulldata");
 
 	if (checkKernelArgument("-krnldbglogdisable")) gFileLoggingEnabled = false;
 	if (checkKernelArgument("-krnldbglogtmp")) {
